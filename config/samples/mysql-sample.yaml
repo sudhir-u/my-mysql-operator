@@ -1,0 +1,9 @@
+apiVersion: database.mycompany.com/v1alpha1
+kind: MySQL
+metadata:
+  name: my-test-mysql
+  namespace: default
+spec:
+  version: "8.0"
+  storageSize: "5Gi"
+  rootPassword: "mysecretpassword"

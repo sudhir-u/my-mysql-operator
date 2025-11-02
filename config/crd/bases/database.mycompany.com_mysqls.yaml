@@ -1,0 +1,87 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: mysqls.database.mycompany.com
+spec:
+  group: database.mycompany.com
+  names:
+    kind: MySQL
+    listKind: MySQLList
+    plural: mysqls
+    singular: mysql
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.ready
+      name: Ready
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: MySQL is the Schema for the mysqls API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: MySQLSpec defines the desired state of MySQL
+            properties:
+              rootPassword:
+                description: RootPassword for MySQL root user (should reference a
+                  secret in production)
+                type: string
+              storageSize:
+                description: StorageSize for the MySQL data volume (e.g., "10Gi")
+                type: string
+              version:
+                description: Version of MySQL to deploy (e.g., "8.0", "5.7")
+                type: string
+            required:
+            - storageSize
+            - version
+            type: object
+          status:
+            description: MySQLStatus defines the observed state of MySQL
+            properties:
+              message:
+                description: Message provides additional information about the current
+                  state
+                type: string
+              phase:
+                description: |-
+                  Phase represents the current state of the MySQL instance
+                  Possible values: Pending, Running, Failed
+                type: string
+              ready:
+                description: Ready indicates whether the MySQL instance is ready to
+                  accept connections
+                type: boolean
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
