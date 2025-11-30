@@ -13,11 +13,68 @@ The operator watches for MySQL custom resources and ensures the desired state ma
 
 ## Getting Started
 
+### Local Development Setup
+
+For local development and testing, you can use Kind (Kubernetes in Docker) to create a local cluster.
+
+**1. Ensure Docker is running:**
+
+If using Colima (macOS):
+```sh
+colima status
+# If not running, start it:
+colima start --cpu 6 --memory 12 --disk 100 --arch aarch64 --vm-type=vz --vz-rosetta
+```
+
+**2. Create a Kind cluster:**
+
+```sh
+kind create cluster --name mysql-operator-dev
+```
+
+**3. Verify the cluster is running:**
+
+```sh
+kubectl cluster-info
+kubectl get nodes
+```
+
+**4. Install CRDs:**
+
+```sh
+make install
+# Or manually:
+kubectl apply -f config/crd/bases/
+```
+
+**5. Run the operator locally (for development):**
+
+```sh
+make run
+```
+
+This runs the operator on your local machine and connects to your Kind cluster. The operator will watch for MySQL resources and create the necessary Kubernetes resources.
+
+**6. In another terminal, create a MySQL instance:**
+
+```sh
+kubectl apply -f config/samples/mysql-8.4.x.yaml
+```
+
+**7. Verify the MySQL instance was created:**
+
+```sh
+kubectl get mysqls
+kubectl get deployments
+kubectl get pods
+```
+
 ### Prerequisites
 - go version v1.24.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- docker version 17.03+ (or Docker Desktop, Colima, etc.)
+- kubectl version v1.11.3+
+- Access to a Kubernetes v1.11.3+ cluster (or use Kind for local development)
+- [Kind](https://kind.sigs.k8s.io/) (optional, for local development)
 
 ### To Deploy on the cluster
 **Build and push your image to the location specified by `IMG`:**
@@ -134,6 +191,94 @@ You can check the status using:
 
 ```sh
 kubectl get mysql <mysql-instance-name> -o yaml
+```
+
+## Troubleshooting
+
+### kubectl Connection Issues
+
+**Error:** `The connection to the server localhost:8080 was refused`
+
+**Solution:** Ensure you have a valid Kubernetes context configured:
+
+```sh
+# Check current context
+kubectl config get-contexts
+
+# If no context is set, ensure your cluster is accessible
+# For Kind clusters:
+kubectl cluster-info --context kind-mysql-operator-dev
+
+# Set the context if needed
+kubectl config use-context kind-mysql-operator-dev
+```
+
+### Docker/Colima Not Running
+
+**Error:** `Cannot connect to the Docker daemon` or `colima is not running`
+
+**Solution:** Start your Docker runtime:
+
+```sh
+# For Colima (macOS):
+colima status
+colima start
+
+# For Docker Desktop:
+# Ensure Docker Desktop is running
+```
+
+### CRDs Not Found
+
+**Error:** `No resources found` when running `kubectl get crds | grep mysql`
+
+**Solution:** Install the CRDs:
+
+```sh
+make install
+# Or manually:
+kubectl apply -f config/crd/bases/
+```
+
+Verify installation:
+```sh
+kubectl get crds | grep mysql
+# Should show: mysqls.database.mycompany.com
+```
+
+### Operator Not Creating Resources
+
+**Issue:** MySQL CR is created but no Deployment/PVC/Service is created
+
+**Solution:**
+1. Ensure the operator is running: `make run` (for local development) or check operator pod status
+2. Check operator logs for errors
+3. Verify RBAC permissions are correctly installed
+4. Ensure the MySQL CR spec has valid values (version and storageSize are required)
+
+### Verification Commands
+
+Use these commands to verify your setup:
+
+```sh
+# Check cluster status
+kubectl cluster-info
+kubectl get nodes
+
+# Check CRDs
+kubectl get crds | grep mysql
+
+# Check MySQL instances
+kubectl get mysqls
+
+# Check created resources
+kubectl get deployments
+kubectl get services
+kubectl get pvc
+kubectl get secrets
+
+# Check operator logs (if deployed)
+kubectl logs -n <operator-namespace> deployment/my-mysql-operator-controller-manager
 ```
 
 ## Contributing
