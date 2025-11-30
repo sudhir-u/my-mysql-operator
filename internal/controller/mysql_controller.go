@@ -33,6 +33,7 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -116,11 +117,8 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	// Update status
-	mysql.Status.Phase = "Running"
-	mysql.Status.Ready = true
-	mysql.Status.Message = "MySQL instance is running"
-	if err := r.Status().Update(ctx, mysql); err != nil {
+	// Update status based on actual Deployment and Pod state
+	if err := r.updateMySQLStatus(ctx, mysql, sanitizedName); err != nil {
 		log.Error(err, "Failed to update MySQL status")
 		return ctrl.Result{}, err
 	}
@@ -131,6 +129,106 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 // sanitizeName ensures the name is DNS-1035 compliant by replacing dots with dashes
 func sanitizeName(name string) string {
 	return strings.ReplaceAll(name, ".", "-")
+}
+
+// updateMySQLStatus updates the MySQL status based on the actual state of the Deployment and Pod
+func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *databasev1alpha1.MySQL, sanitizedName string) error {
+	log := log.FromContext(ctx)
+
+	// Check if Deployment exists
+	deployment := &appsv1.Deployment{}
+	err := r.Get(ctx, types.NamespacedName{Name: sanitizedName, Namespace: mysql.Namespace}, deployment)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			mysql.Status.Phase = "Pending"
+			mysql.Status.Ready = false
+			mysql.Status.Message = "Deployment not found, resources are being created"
+			return r.Status().Update(ctx, mysql)
+		}
+		return err
+	}
+
+	// Check Deployment status
+	availableReplicas := deployment.Status.AvailableReplicas
+	readyReplicas := deployment.Status.ReadyReplicas
+	replicas := deployment.Status.Replicas
+
+	// If no replicas are available yet, status is Pending
+	if availableReplicas == 0 {
+		mysql.Status.Phase = "Pending"
+		mysql.Status.Ready = false
+		if replicas > 0 {
+			mysql.Status.Message = "MySQL pod is starting up"
+		} else {
+			mysql.Status.Message = "Waiting for Deployment to create pods"
+		}
+		return r.Status().Update(ctx, mysql)
+	}
+
+	// Check Pod status to get more detailed information
+	podList := &corev1.PodList{}
+	err = r.List(ctx, podList, client.InNamespace(mysql.Namespace), client.MatchingLabels(map[string]string{"app": sanitizedName}))
+	if err != nil {
+		log.Error(err, "Failed to list pods for status check")
+		// Continue with Deployment status if pod list fails
+	} else if len(podList.Items) > 0 {
+		pod := podList.Items[0] // Get the first pod (should only be one for single replica)
+
+		// Check pod phase
+		switch pod.Status.Phase {
+		case corev1.PodPending:
+			mysql.Status.Phase = "Pending"
+			mysql.Status.Ready = false
+			mysql.Status.Message = "Pod is pending, waiting for resources"
+			return r.Status().Update(ctx, mysql)
+		case corev1.PodFailed:
+			mysql.Status.Phase = "Failed"
+			mysql.Status.Ready = false
+			mysql.Status.Message = "Pod has failed"
+			// Add container status message if available
+			for _, containerStatus := range pod.Status.ContainerStatuses {
+				if containerStatus.State.Waiting != nil {
+					mysql.Status.Message = fmt.Sprintf("Pod failed: %s", containerStatus.State.Waiting.Message)
+				} else if containerStatus.State.Terminated != nil {
+					mysql.Status.Message = fmt.Sprintf("Pod terminated: %s", containerStatus.State.Terminated.Message)
+				}
+			}
+			return r.Status().Update(ctx, mysql)
+		case corev1.PodRunning:
+			// Check if pod is ready
+			isReady := false
+			for _, condition := range pod.Status.Conditions {
+				if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+
+			if isReady && readyReplicas > 0 {
+				mysql.Status.Phase = "Running"
+				mysql.Status.Ready = true
+				mysql.Status.Message = "MySQL instance is running and ready"
+			} else {
+				mysql.Status.Phase = "Pending"
+				mysql.Status.Ready = false
+				mysql.Status.Message = "Pod is running but not ready yet"
+			}
+			return r.Status().Update(ctx, mysql)
+		}
+	}
+
+	// Fallback: Use Deployment status
+	if readyReplicas > 0 && availableReplicas > 0 {
+		mysql.Status.Phase = "Running"
+		mysql.Status.Ready = true
+		mysql.Status.Message = "MySQL instance is running"
+	} else {
+		mysql.Status.Phase = "Pending"
+		mysql.Status.Ready = false
+		mysql.Status.Message = "Waiting for MySQL to become ready"
+	}
+
+	return r.Status().Update(ctx, mysql)
 }
 
 func (r *MySQLReconciler) secretForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *corev1.Secret {

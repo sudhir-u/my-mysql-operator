@@ -69,6 +69,15 @@ kubectl get deployments
 kubectl get pods
 ```
 
+**8. Monitor the status transition:**
+
+Watch the MySQL status change from Pending to Running:
+```sh
+kubectl get mysql my-mysql-8.4.x -w
+```
+
+You should see the status transition as the MySQL pod starts up and becomes ready.
+
 ### Prerequisites
 - go version v1.24.0+
 - docker version 17.03+ (or Docker Desktop, Colima, etc.)
@@ -181,17 +190,41 @@ The MySQL CRD supports the following spec fields:
 
 #### Status Fields
 
-The operator updates the MySQL resource status with:
+The operator automatically updates the MySQL resource status based on the actual state of the Deployment and Pod:
 
-- **phase**: Current state of the MySQL instance (Pending, Running, Failed)
-- **ready**: Boolean indicating if MySQL is ready to accept connections
-- **message**: Additional information about the current state
+- **phase**: Current state of the MySQL instance
+  - `Pending`: Resources are being created or MySQL pod is starting up
+  - `Running`: MySQL pod is running and ready to accept connections
+  - `Failed`: MySQL pod has failed to start or crashed
+- **ready**: Boolean indicating if MySQL is ready to accept connections (true when phase is Running)
+- **message**: Detailed information about the current state (e.g., "MySQL instance is running and ready", "Pod is pending, waiting for resources")
 
-You can check the status using:
+**Monitoring Status:**
 
+Watch the status in real-time:
+```sh
+kubectl get mysql <mysql-instance-name> -w
+```
+
+Check detailed status:
 ```sh
 kubectl get mysql <mysql-instance-name> -o yaml
 ```
+
+View status in a table format:
+```sh
+kubectl get mysql
+# Output shows: NAME, PHASE, READY, AGE
+```
+
+**Status Lifecycle:**
+
+When you create a MySQL instance, the status typically transitions:
+1. `Pending` → Resources are being created (Deployment, PVC, Service, Secret)
+2. `Pending` → Pod is starting up or waiting for resources
+3. `Running` → Pod is ready and MySQL is accepting connections
+
+If something goes wrong, the status will show `Failed` with a descriptive message.
 
 ## Troubleshooting
 
@@ -268,17 +301,28 @@ kubectl get nodes
 # Check CRDs
 kubectl get crds | grep mysql
 
-# Check MySQL instances
+# Check MySQL instances and their status
 kubectl get mysqls
+kubectl get mysqls -o wide  # Shows more details
 
 # Check created resources
 kubectl get deployments
 kubectl get services
 kubectl get pvc
 kubectl get secrets
+kubectl get pods -l app=<mysql-instance-name>
+
+# Check MySQL pod status
+kubectl get pods -l app=<mysql-instance-name>
+kubectl describe pod <mysql-pod-name>
+
+# Check MySQL status details
+kubectl get mysql <mysql-instance-name> -o yaml | grep -A 5 status
 
 # Check operator logs (if deployed)
 kubectl logs -n <operator-namespace> deployment/my-mysql-operator-controller-manager
+
+# For local development (make run), check terminal output for reconciliation logs
 ```
 
 ## Contributing
