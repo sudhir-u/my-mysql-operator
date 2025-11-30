@@ -1,9 +1,9 @@
 apiVersion: database.mycompany.com/v1alpha1
 kind: MySQL
 metadata:
-  name: my-mysql-84x
+  name: my-mysql-8.0.x
   namespace: default
 spec:
-  version: "8.4"
+  version: "8.0"
   storageSize: "2Gi"
   rootPassword: "mysecretnewpassword"
