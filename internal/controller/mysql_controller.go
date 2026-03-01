@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -131,7 +132,8 @@ func sanitizeName(name string) string {
 	return strings.ReplaceAll(name, ".", "-")
 }
 
-// updateMySQLStatus updates the MySQL status based on the actual state of the Deployment and Pod
+// updateMySQLStatus updates the MySQL status based on the actual state of the Deployment and Pod.
+// Uses retry-on-conflict to handle concurrent updates and resource version conflicts.
 func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *databasev1alpha1.MySQL, sanitizedName string) error {
 	log := log.FromContext(ctx)
 
@@ -140,10 +142,7 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 	err := r.Get(ctx, types.NamespacedName{Name: sanitizedName, Namespace: mysql.Namespace}, deployment)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			mysql.Status.Phase = "Pending"
-			mysql.Status.Ready = false
-			mysql.Status.Message = "Deployment not found, resources are being created"
-			return r.Status().Update(ctx, mysql)
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Deployment not found, resources are being created")
 		}
 		return err
 	}
@@ -155,14 +154,11 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 
 	// If no replicas are available yet, status is Pending
 	if availableReplicas == 0 {
-		mysql.Status.Phase = "Pending"
-		mysql.Status.Ready = false
+		msg := "Waiting for Deployment to create pods"
 		if replicas > 0 {
-			mysql.Status.Message = "MySQL pod is starting up"
-		} else {
-			mysql.Status.Message = "Waiting for Deployment to create pods"
+			msg = "MySQL pod is starting up"
 		}
-		return r.Status().Update(ctx, mysql)
+		return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, msg)
 	}
 
 	// Check Pod status to get more detailed information
@@ -177,25 +173,21 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 		// Check pod phase
 		switch pod.Status.Phase {
 		case corev1.PodPending:
-			mysql.Status.Phase = "Pending"
-			mysql.Status.Ready = false
-			mysql.Status.Message = "Pod is pending, waiting for resources"
-			return r.Status().Update(ctx, mysql)
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Pod is pending, waiting for resources")
 		case corev1.PodFailed:
-			mysql.Status.Phase = "Failed"
-			mysql.Status.Ready = false
-			mysql.Status.Message = "Pod has failed"
-			// Add container status message if available
+			msg := "Pod has failed"
 			for _, containerStatus := range pod.Status.ContainerStatuses {
 				if containerStatus.State.Waiting != nil {
-					mysql.Status.Message = fmt.Sprintf("Pod failed: %s", containerStatus.State.Waiting.Message)
-				} else if containerStatus.State.Terminated != nil {
-					mysql.Status.Message = fmt.Sprintf("Pod terminated: %s", containerStatus.State.Terminated.Message)
+					msg = fmt.Sprintf("Pod failed: %s", containerStatus.State.Waiting.Message)
+					break
+				}
+				if containerStatus.State.Terminated != nil {
+					msg = fmt.Sprintf("Pod terminated: %s", containerStatus.State.Terminated.Message)
+					break
 				}
 			}
-			return r.Status().Update(ctx, mysql)
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Failed", false, msg)
 		case corev1.PodRunning:
-			// Check if pod is ready
 			isReady := false
 			for _, condition := range pod.Status.Conditions {
 				if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
@@ -205,30 +197,32 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 			}
 
 			if isReady && readyReplicas > 0 {
-				mysql.Status.Phase = "Running"
-				mysql.Status.Ready = true
-				mysql.Status.Message = "MySQL instance is running and ready"
-			} else {
-				mysql.Status.Phase = "Pending"
-				mysql.Status.Ready = false
-				mysql.Status.Message = "Pod is running but not ready yet"
+				return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running and ready")
 			}
-			return r.Status().Update(ctx, mysql)
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Pod is running but not ready yet")
 		}
 	}
 
 	// Fallback: Use Deployment status
 	if readyReplicas > 0 && availableReplicas > 0 {
-		mysql.Status.Phase = "Running"
-		mysql.Status.Ready = true
-		mysql.Status.Message = "MySQL instance is running"
-	} else {
-		mysql.Status.Phase = "Pending"
-		mysql.Status.Ready = false
-		mysql.Status.Message = "Waiting for MySQL to become ready"
+		return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running")
 	}
+	return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Waiting for MySQL to become ready")
+}
 
-	return r.Status().Update(ctx, mysql)
+// statusUpdateWithRetry performs a status update with retry-on-conflict to handle
+// concurrent modifications (e.g. rapid re-reconciliation or external updates).
+func (r *MySQLReconciler) statusUpdateWithRetry(ctx context.Context, ns, name, phase string, ready bool, message string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		mysql := &databasev1alpha1.MySQL{}
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, mysql); err != nil {
+			return err
+		}
+		mysql.Status.Phase = phase
+		mysql.Status.Ready = ready
+		mysql.Status.Message = message
+		return r.Status().Update(ctx, mysql)
+	})
 }
 
 func (r *MySQLReconciler) secretForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *corev1.Secret {
