@@ -499,7 +499,7 @@ func (r *MySQLReconciler) serviceForMySQL(m *databasev1alpha1.MySQL, sanitizedNa
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{
-				"app":         sanitizedName,
+				"app":        sanitizedName,
 				"mysql-role": "primary",
 			},
 			Ports: []corev1.ServicePort{
