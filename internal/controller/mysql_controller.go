@@ -30,9 +30,8 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups=database.mycompany.com,resources=mysqls,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=database.mycompany.com,resources=mysqls/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=database.mycompany.com,resources=mysqls/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
@@ -70,34 +69,32 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	// Create or update PVC
-	pvc := r.pvcForMySQL(mysql, sanitizedName)
-	if err := controllerutil.SetControllerReference(mysql, pvc, r.Scheme); err != nil {
+	// Create or update headless Service (required for StatefulSet)
+	headlessSvc := r.headlessServiceForMySQL(mysql, sanitizedName)
+	if err := controllerutil.SetControllerReference(mysql, headlessSvc, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
-	foundPVC := &corev1.PersistentVolumeClaim{}
-	err = r.Get(ctx, types.NamespacedName{Name: pvc.Name, Namespace: pvc.Namespace}, foundPVC)
+	foundHeadless := &corev1.Service{}
+	err = r.Get(ctx, types.NamespacedName{Name: headlessSvc.Name, Namespace: headlessSvc.Namespace}, foundHeadless)
 	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating a new PVC", "PVC.Namespace", pvc.Namespace, "PVC.Name", pvc.Name)
-		err = r.Create(ctx, pvc)
-		if err != nil {
-			log.Error(err, "Failed to create new PVC")
+		log.Info("Creating headless Service", "Service.Namespace", headlessSvc.Namespace, "Service.Name", headlessSvc.Name)
+		if err = r.Create(ctx, headlessSvc); err != nil {
+			log.Error(err, "Failed to create headless Service")
 			return ctrl.Result{}, err
 		}
 	}
 
-	// Create or update Deployment
-	deployment := r.deploymentForMySQL(mysql, sanitizedName)
-	if err := controllerutil.SetControllerReference(mysql, deployment, r.Scheme); err != nil {
+	// Create or update StatefulSet
+	sts := r.statefulSetForMySQL(mysql, sanitizedName)
+	if err := controllerutil.SetControllerReference(mysql, sts, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
-	foundDeployment := &appsv1.Deployment{}
-	err = r.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, foundDeployment)
+	foundSTS := &appsv1.StatefulSet{}
+	err = r.Get(ctx, types.NamespacedName{Name: sts.Name, Namespace: sts.Namespace}, foundSTS)
 	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating a new Deployment", "Deployment.Namespace", deployment.Namespace, "Deployment.Name", deployment.Name)
-		err = r.Create(ctx, deployment)
-		if err != nil {
-			log.Error(err, "Failed to create new Deployment")
+		log.Info("Creating StatefulSet", "StatefulSet.Namespace", sts.Namespace, "StatefulSet.Name", sts.Name)
+		if err = r.Create(ctx, sts); err != nil {
+			log.Error(err, "Failed to create StatefulSet")
 			return ctrl.Result{}, err
 		}
 	}
@@ -132,29 +129,29 @@ func sanitizeName(name string) string {
 	return strings.ReplaceAll(name, ".", "-")
 }
 
-// updateMySQLStatus updates the MySQL status based on the actual state of the Deployment and Pod.
+// updateMySQLStatus updates the MySQL status based on the actual state of the StatefulSet and Pods.
 // Uses retry-on-conflict to handle concurrent updates and resource version conflicts.
 func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *databasev1alpha1.MySQL, sanitizedName string) error {
 	log := log.FromContext(ctx)
 
-	// Check if Deployment exists
-	deployment := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Name: sanitizedName, Namespace: mysql.Namespace}, deployment)
+	// Check if StatefulSet exists
+	sts := &appsv1.StatefulSet{}
+	err := r.Get(ctx, types.NamespacedName{Name: sanitizedName, Namespace: mysql.Namespace}, sts)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Deployment not found, resources are being created")
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "StatefulSet not found, resources are being created")
 		}
 		return err
 	}
 
-	// Check Deployment status
-	availableReplicas := deployment.Status.AvailableReplicas
-	readyReplicas := deployment.Status.ReadyReplicas
-	replicas := deployment.Status.Replicas
+	// Check StatefulSet status
+	availableReplicas := sts.Status.AvailableReplicas
+	readyReplicas := sts.Status.ReadyReplicas
+	replicas := sts.Status.Replicas
 
 	// If no replicas are available yet, status is Pending
 	if availableReplicas == 0 {
-		msg := "Waiting for Deployment to create pods"
+		msg := "Waiting for StatefulSet to create pods"
 		if replicas > 0 {
 			msg = "MySQL pod is starting up"
 		}
@@ -166,11 +163,9 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 	err = r.List(ctx, podList, client.InNamespace(mysql.Namespace), client.MatchingLabels(map[string]string{"app": sanitizedName}))
 	if err != nil {
 		log.Error(err, "Failed to list pods for status check")
-		// Continue with Deployment status if pod list fails
 	} else if len(podList.Items) > 0 {
-		pod := podList.Items[0] // Get the first pod (should only be one for single replica)
+		pod := podList.Items[0] // First pod (e.g. mysql-0 for single replica)
 
-		// Check pod phase
 		switch pod.Status.Phase {
 		case corev1.PodPending:
 			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Pod is pending, waiting for resources")
@@ -195,7 +190,6 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 					break
 				}
 			}
-
 			if isReady && readyReplicas > 0 {
 				return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running and ready")
 			}
@@ -203,7 +197,7 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 		}
 	}
 
-	// Fallback: Use Deployment status
+	// Fallback: Use StatefulSet status
 	if readyReplicas > 0 && availableReplicas > 0 {
 		return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running")
 	}
@@ -243,46 +237,40 @@ func (r *MySQLReconciler) secretForMySQL(m *databasev1alpha1.MySQL, sanitizedNam
 	return secret
 }
 
-func (r *MySQLReconciler) pvcForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *corev1.PersistentVolumeClaim {
-	pvc := &corev1.PersistentVolumeClaim{
+// headlessServiceForMySQL returns a headless Service required by the StatefulSet (stable network identity).
+func (r *MySQLReconciler) headlessServiceForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *corev1.Service {
+	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sanitizedName + "-pvc",
+			Name:      sanitizedName + "-headless",
 			Namespace: m.Namespace,
 		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{
-				corev1.ReadWriteOnce,
-			},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(m.Spec.StorageSize),
-				},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: corev1.ClusterIPNone,
+			Selector:  map[string]string{"app": sanitizedName},
+			Ports: []corev1.ServicePort{
+				{Port: 3306, Name: "mysql", Protocol: corev1.ProtocolTCP},
 			},
 		},
 	}
-	return pvc
 }
 
-func (r *MySQLReconciler) deploymentForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *appsv1.Deployment {
+// statefulSetForMySQL returns a StatefulSet for MySQL with per-pod PVC via volumeClaimTemplates.
+func (r *MySQLReconciler) statefulSetForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *appsv1.StatefulSet {
 	replicas := int32(1)
-
-	deployment := &appsv1.Deployment{
+	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sanitizedName,
 			Namespace: m.Namespace,
 		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: sanitizedName + "-headless",
+			Replicas:    &replicas,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app": sanitizedName,
-				},
+				MatchLabels: map[string]string{"app": sanitizedName},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app": sanitizedName,
-					},
+					Labels: map[string]string{"app": sanitizedName},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
@@ -290,39 +278,35 @@ func (r *MySQLReconciler) deploymentForMySQL(m *databasev1alpha1.MySQL, sanitize
 							Name:  "mysql",
 							Image: fmt.Sprintf("mysql:%s", m.Spec.Version),
 							Ports: []corev1.ContainerPort{
-								{
-									ContainerPort: 3306,
-									Name:          "mysql",
-								},
+								{ContainerPort: 3306, Name: "mysql"},
 							},
 							Env: []corev1.EnvVar{
 								{
 									Name: "MYSQL_ROOT_PASSWORD",
 									ValueFrom: &corev1.EnvVarSource{
 										SecretKeyRef: &corev1.SecretKeySelector{
-											LocalObjectReference: corev1.LocalObjectReference{
-												Name: sanitizedName + "-secret",
-											},
-											Key: "root-password",
+											LocalObjectReference: corev1.LocalObjectReference{Name: sanitizedName + "-secret"},
+											Key:                  "root-password",
 										},
 									},
 								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
-								{
-									Name:      "mysql-data",
-									MountPath: "/var/lib/mysql",
-								},
+								{Name: "mysql-data", MountPath: "/var/lib/mysql"},
 							},
 						},
 					},
-					Volumes: []corev1.Volume{
-						{
-							Name: "mysql-data",
-							VolumeSource: corev1.VolumeSource{
-								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-									ClaimName: sanitizedName + "-pvc",
-								},
+					// Volumes for volumeClaimTemplates are injected by the StatefulSet controller
+				},
+			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "mysql-data"},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse(m.Spec.StorageSize),
 							},
 						},
 					},
@@ -330,7 +314,6 @@ func (r *MySQLReconciler) deploymentForMySQL(m *databasev1alpha1.MySQL, sanitize
 			},
 		},
 	}
-	return deployment
 }
 
 func (r *MySQLReconciler) serviceForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *corev1.Service {
@@ -360,9 +343,8 @@ func (r *MySQLReconciler) serviceForMySQL(m *databasev1alpha1.MySQL, sanitizedNa
 func (r *MySQLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&databasev1alpha1.MySQL{}).
-		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.Secret{}).
 		Complete(r)
 }
