@@ -1,0 +1,13 @@
+# MySQL with 2 replicas (primary/standby) for failover POC.
+# The operator designates one pod as primary; the primary Service routes to it.
+# On primary pod or node failure, the controller promotes the standby and updates the Service.
+apiVersion: database.mycompany.com/v1alpha1
+kind: MySQL
+metadata:
+  name: my-mysql-ha
+  namespace: default
+spec:
+  version: "8.4"
+  storageSize: "2Gi"
+  rootPassword: "mysecretnewpassword"
+  replicas: 2

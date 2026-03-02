@@ -21,6 +21,9 @@ spec:
     - jsonPath: .status.ready
       name: Ready
       type: boolean
+    - jsonPath: .status.primaryPodName
+      name: Primary
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -49,6 +52,13 @@ spec:
           spec:
             description: MySQLSpec defines the desired state of MySQL
             properties:
+              replicas:
+                description: Replicas is the number of MySQL pods (1 = single instance,
+                  2 = primary/standby for failover).
+                format: int32
+                maximum: 2
+                minimum: 1
+                type: integer
               rootPassword:
                 description: RootPassword for MySQL root user (should reference a
                   secret in production)
@@ -74,6 +84,11 @@ spec:
                 description: |-
                   Phase represents the current state of the MySQL instance
                   Possible values: Pending, Running, Failed
+                type: string
+              primaryPodName:
+                description: |-
+                  PrimaryPodName is the name of the pod currently designated as primary (for HA with 2 replicas).
+                  Used by the failover controller to route the primary Service and to decide failover target.
                 type: string
               ready:
                 description: Ready indicates whether the MySQL instance is ready to

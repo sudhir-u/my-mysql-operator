@@ -17,6 +17,12 @@ type MySQLSpec struct {
 	// RootPassword for MySQL root user (should reference a secret in production)
 	// +optional
 	RootPassword string `json:"rootPassword,omitempty"`
+
+	// Replicas is the number of MySQL pods (1 = single instance, 2 = primary/standby for failover).
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=2
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 // MySQLStatus defines the observed state of MySQL
@@ -30,12 +36,18 @@ type MySQLStatus struct {
 
 	// Ready indicates whether the MySQL instance is ready to accept connections
 	Ready bool `json:"ready,omitempty"`
+
+	// PrimaryPodName is the name of the pod currently designated as primary (for HA with 2 replicas).
+	// Used by the failover controller to route the primary Service and to decide failover target.
+	// +optional
+	PrimaryPodName string `json:"primaryPodName,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Ready",type=boolean,JSONPath=`.status.ready`
+// +kubebuilder:printcolumn:name="Primary",type=string,JSONPath=`.status.primaryPodName`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // MySQL is the Schema for the mysqls API

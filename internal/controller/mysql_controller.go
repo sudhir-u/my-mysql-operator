@@ -33,7 +33,8 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 
 func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -115,7 +116,13 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	// Update status based on actual Deployment and Pod state
+	// Failover: ensure primary designation and pod labels (mysql-role=primary|standby); run when replicas >= 2
+	if err := r.ensurePrimaryAndFailover(ctx, mysql, sanitizedName); err != nil {
+		log.Error(err, "Failed to ensure primary/failover")
+		return ctrl.Result{}, err
+	}
+
+	// Update status based on actual StatefulSet and Pod state
 	if err := r.updateMySQLStatus(ctx, mysql, sanitizedName); err != nil {
 		log.Error(err, "Failed to update MySQL status")
 		return ctrl.Result{}, err
@@ -127,6 +134,169 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 // sanitizeName ensures the name is DNS-1035 compliant by replacing dots with dashes
 func sanitizeName(name string) string {
 	return strings.ReplaceAll(name, ".", "-")
+}
+
+const (
+	labelMySQLRole = "mysql-role"
+	rolePrimary    = "primary"
+	roleStandby    = "standby"
+)
+
+// ensurePrimaryAndFailover: for replicas>=2, designates primary, monitors health, fences on failure, promotes standby, and updates pod labels so the primary Service routes to the current primary.
+func (r *MySQLReconciler) ensurePrimaryAndFailover(ctx context.Context, mysql *databasev1alpha1.MySQL, sanitizedName string) error {
+	log := log.FromContext(ctx)
+	replicas := int32(1)
+	if mysql.Spec.Replicas != nil && *mysql.Spec.Replicas >= 1 && *mysql.Spec.Replicas <= 2 {
+		replicas = *mysql.Spec.Replicas
+	}
+
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(mysql.Namespace), client.MatchingLabels(map[string]string{"app": sanitizedName})); err != nil {
+		return err
+	}
+	if len(podList.Items) == 0 {
+		return nil
+	}
+
+	// Single replica: ensure the only pod has mysql-role=primary; clear status.primaryPodName or set to it
+	if replicas == 1 {
+		pod := &podList.Items[0]
+		if pod.Labels[labelMySQLRole] != rolePrimary {
+			if err := r.patchPodLabel(ctx, pod, labelMySQLRole, rolePrimary); err != nil {
+				return err
+			}
+		}
+		return r.statusUpdatePrimaryPod(ctx, mysql.Namespace, mysql.Name, pod.Name)
+	}
+
+	// Two replicas: primary/standby failover logic
+	currentPrimary := mysql.Status.PrimaryPodName
+	readyPods := make([]corev1.Pod, 0, 2)
+	for i := range podList.Items {
+		if r.isPodReady(&podList.Items[i]) {
+			readyPods = append(readyPods, podList.Items[i])
+		}
+	}
+
+	// Designate initial primary (lowest ordinal that is ready)
+	if currentPrimary == "" {
+		if len(readyPods) == 0 {
+			return nil
+		}
+		chosen := r.podWithLowestOrdinal(readyPods)
+		if err := r.setPrimaryLabels(ctx, mysql.Namespace, sanitizedName, chosen.Name, podList.Items); err != nil {
+			return err
+		}
+		return r.statusUpdatePrimaryPod(ctx, mysql.Namespace, mysql.Name, chosen.Name)
+	}
+
+	// Find current primary pod
+	var primaryPod *corev1.Pod
+	for i := range podList.Items {
+		if podList.Items[i].Name == currentPrimary {
+			primaryPod = &podList.Items[i]
+			break
+		}
+	}
+
+	// Primary pod missing or not ready or node not ready -> failover
+	needFailover := primaryPod == nil || !r.isPodReady(primaryPod)
+	if primaryPod != nil && primaryPod.Spec.NodeName != "" {
+		if nodeReady, _ := r.isNodeReady(ctx, primaryPod.Spec.NodeName); !nodeReady {
+			needFailover = true
+		}
+	}
+
+	if needFailover {
+		// Promote standby: pick another ready pod (exclude current primary)
+		var newPrimary *corev1.Pod
+		for i := range readyPods {
+			if readyPods[i].Name != currentPrimary {
+				newPrimary = &readyPods[i]
+				break
+			}
+		}
+		if newPrimary == nil {
+			log.Info("Failover needed but no other ready pod", "currentPrimary", currentPrimary)
+			return nil
+		}
+		log.Info("Failover: promoting standby to primary", "oldPrimary", currentPrimary, "newPrimary", newPrimary.Name)
+		// Fencing: relabel old primary to standby (so Service no longer routes to it)
+		// Promotion: set new primary pod label
+		if err := r.setPrimaryLabels(ctx, mysql.Namespace, sanitizedName, newPrimary.Name, podList.Items); err != nil {
+			return err
+		}
+		return r.statusUpdatePrimaryPod(ctx, mysql.Namespace, mysql.Name, newPrimary.Name)
+	}
+
+	// Ensure labels are correct
+	return r.setPrimaryLabels(ctx, mysql.Namespace, sanitizedName, currentPrimary, podList.Items)
+}
+
+func (r *MySQLReconciler) isPodReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *MySQLReconciler) isNodeReady(ctx context.Context, nodeName string) (bool, error) {
+	node := &corev1.Node{}
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		return false, err
+	}
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady && c.Status == corev1.ConditionTrue {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *MySQLReconciler) podWithLowestOrdinal(pods []corev1.Pod) *corev1.Pod {
+	if len(pods) == 0 {
+		return nil
+	}
+	out := &pods[0]
+	for i := 1; i < len(pods); i++ {
+		if pods[i].Name < out.Name {
+			out = &pods[i]
+		}
+	}
+	return out
+}
+
+func (r *MySQLReconciler) setPrimaryLabels(ctx context.Context, ns, sanitizedName, primaryName string, pods []corev1.Pod) error {
+	for i := range pods {
+		role := roleStandby
+		if pods[i].Name == primaryName {
+			role = rolePrimary
+		}
+		if pods[i].Labels[labelMySQLRole] != role {
+			if err := r.patchPodLabel(ctx, &pods[i], labelMySQLRole, role); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (r *MySQLReconciler) patchPodLabel(ctx context.Context, pod *corev1.Pod, key, value string) error {
+	payload := []byte(fmt.Sprintf(`{"metadata":{"labels":{%q:%q}}}`, key, value))
+	return r.Patch(ctx, pod, client.RawPatch(types.StrategicMergePatchType, payload))
+}
+
+func (r *MySQLReconciler) statusUpdatePrimaryPod(ctx context.Context, ns, name, primaryPodName string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		mysql := &databasev1alpha1.MySQL{}
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, mysql); err != nil {
+			return err
+		}
+		mysql.Status.PrimaryPodName = primaryPodName
+		return r.Status().Update(ctx, mysql)
+	})
 }
 
 // updateMySQLStatus updates the MySQL status based on the actual state of the StatefulSet and Pods.
@@ -257,6 +427,9 @@ func (r *MySQLReconciler) headlessServiceForMySQL(m *databasev1alpha1.MySQL, san
 // statefulSetForMySQL returns a StatefulSet for MySQL with per-pod PVC via volumeClaimTemplates.
 func (r *MySQLReconciler) statefulSetForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *appsv1.StatefulSet {
 	replicas := int32(1)
+	if m.Spec.Replicas != nil && *m.Spec.Replicas >= 1 && *m.Spec.Replicas <= 2 {
+		replicas = *m.Spec.Replicas
+	}
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sanitizedName,
@@ -316,27 +489,25 @@ func (r *MySQLReconciler) statefulSetForMySQL(m *databasev1alpha1.MySQL, sanitiz
 	}
 }
 
+// serviceForMySQL returns the primary Service; selector uses mysql-role=primary so
+// traffic goes only to the current primary pod (updated by failover logic).
 func (r *MySQLReconciler) serviceForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *corev1.Service {
-	service := &corev1.Service{
+	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sanitizedName + "-service",
 			Namespace: m.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{
-				"app": sanitizedName,
+				"app":         sanitizedName,
+				"mysql-role": "primary",
 			},
 			Ports: []corev1.ServicePort{
-				{
-					Port:     3306,
-					Name:     "mysql",
-					Protocol: corev1.ProtocolTCP,
-				},
+				{Port: 3306, Name: "mysql", Protocol: corev1.ProtocolTCP},
 			},
 			Type: corev1.ServiceTypeClusterIP,
 		},
 	}
-	return service
 }
 
 // SetupWithManager sets up the controller with the Manager.
