@@ -1,0 +1,11 @@
+# Owned by Offering / Release — update via PR after manual vendor lookup (R6.1).
+# Do not edit Go controller or CRD code for routine version bumps.
+#
+# Workflow: edit this file → open PR → merge → deploy (make deploy / release pipeline).
+# The operator reads these pins as ConfigMap mysql-channel-pins and rolls channel-based
+# MySQL instances during each instance's maintenanceWindow (R6.2 / R6.3).
+#
+# channels maps a Spec version channel (major.minor) to a concrete MySQL image tag.
+channels:
+  "8.4": "8.4.13"
+  "8.0": "8.0.46"

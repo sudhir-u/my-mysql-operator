@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -16,7 +17,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	databasev1alpha1 "github.com/sudhir-u/my-mysql-operator/api/v1alpha1"
 )
@@ -35,6 +38,7 @@ type MySQLReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
 
 func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -54,6 +58,14 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Use sanitized name for all resources
 	sanitizedName := sanitizeName(mysql.Name)
 
+	pins, err := r.loadChannelPins(ctx)
+	if err != nil {
+		log.Error(err, "Failed to load channel pins ConfigMap")
+		return ctrl.Result{}, err
+	}
+	resolvedTag := ResolveImageTag(mysql.Spec.Version, pins)
+	resolvedImage := fmt.Sprintf("mysql:%s", resolvedTag)
+
 	// Create or update Secret
 	secret := r.secretForMySQL(mysql, sanitizedName)
 	if err := controllerutil.SetControllerReference(mysql, secret, r.Scheme); err != nil {
@@ -68,6 +80,8 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			log.Error(err, "Failed to create new Secret")
 			return ctrl.Result{}, err
 		}
+	} else if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// Create or update headless Service (required for StatefulSet)
@@ -83,19 +97,59 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			log.Error(err, "Failed to create headless Service")
 			return ctrl.Result{}, err
 		}
+	} else if err != nil {
+		return ctrl.Result{}, err
 	}
 
-	// Create or update StatefulSet
-	sts := r.statefulSetForMySQL(mysql, sanitizedName)
+	// Create or update StatefulSet (image from channel pins + Spec)
+	sts := r.statefulSetForMySQL(mysql, sanitizedName, resolvedTag)
 	if err := controllerutil.SetControllerReference(mysql, sts, r.Scheme); err != nil {
 		return ctrl.Result{}, err
 	}
 	foundSTS := &appsv1.StatefulSet{}
 	err = r.Get(ctx, types.NamespacedName{Name: sts.Name, Namespace: sts.Namespace}, foundSTS)
 	if err != nil && errors.IsNotFound(err) {
-		log.Info("Creating StatefulSet", "StatefulSet.Namespace", sts.Namespace, "StatefulSet.Name", sts.Name)
+		log.Info("Creating StatefulSet", "StatefulSet.Namespace", sts.Namespace, "StatefulSet.Name", sts.Name, "image", resolvedImage)
 		if err = r.Create(ctx, sts); err != nil {
 			log.Error(err, "Failed to create StatefulSet")
+			return ctrl.Result{}, err
+		}
+	} else if err != nil {
+		log.Error(err, "Failed to get StatefulSet")
+		return ctrl.Result{}, err
+	} else {
+		currentImage := ""
+		if len(foundSTS.Spec.Template.Spec.Containers) > 0 {
+			currentImage = foundSTS.Spec.Template.Spec.Containers[0].Image
+		}
+		desiredImage := resolvedImage
+		if desiredImage != currentImage && IsPinDrivenUpgrade(mysql.Spec.Version, pins, resolvedTag) {
+			now := time.Now().UTC()
+			if mysql.Spec.MaintenanceWindow == nil {
+				phase := mysql.Status.Phase
+				if phase == "" {
+					phase = "Pending"
+				}
+				msg := fmt.Sprintf("Upgrade to %s deferred: set spec.maintenanceWindow to allow pin-driven upgrades", desiredImage)
+				if err := r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, phase, mysql.Status.Ready, msg, desiredImage); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: time.Hour}, nil
+			}
+			if !InMaintenanceWindow(now, mysql.Spec.MaintenanceWindow) {
+				phase := mysql.Status.Phase
+				if phase == "" {
+					phase = "Pending"
+				}
+				msg := fmt.Sprintf("Upgrade to %s deferred until maintenance window %s-%s UTC", desiredImage, mysql.Spec.MaintenanceWindow.Start, mysql.Spec.MaintenanceWindow.End)
+				if err := r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, phase, mysql.Status.Ready, msg, desiredImage); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: TimeUntilMaintenanceWindow(now, mysql.Spec.MaintenanceWindow)}, nil
+			}
+		}
+		if err := r.reconcileStatefulSet(ctx, foundSTS, sts); err != nil {
+			log.Error(err, "Failed to update StatefulSet")
 			return ctrl.Result{}, err
 		}
 	}
@@ -123,7 +177,7 @@ func (r *MySQLReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	// Update status based on actual StatefulSet and Pod state
-	if err := r.updateMySQLStatus(ctx, mysql, sanitizedName); err != nil {
+	if err := r.updateMySQLStatus(ctx, mysql, sanitizedName, resolvedImage); err != nil {
 		log.Error(err, "Failed to update MySQL status")
 		return ctrl.Result{}, err
 	}
@@ -301,7 +355,7 @@ func (r *MySQLReconciler) statusUpdatePrimaryPod(ctx context.Context, ns, name, 
 
 // updateMySQLStatus updates the MySQL status based on the actual state of the StatefulSet and Pods.
 // Uses retry-on-conflict to handle concurrent updates and resource version conflicts.
-func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *databasev1alpha1.MySQL, sanitizedName string) error {
+func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *databasev1alpha1.MySQL, sanitizedName, resolvedImage string) error {
 	log := log.FromContext(ctx)
 
 	// Check if StatefulSet exists
@@ -309,7 +363,7 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 	err := r.Get(ctx, types.NamespacedName{Name: sanitizedName, Namespace: mysql.Namespace}, sts)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "StatefulSet not found, resources are being created")
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "StatefulSet not found, resources are being created", resolvedImage)
 		}
 		return err
 	}
@@ -325,7 +379,7 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 		if replicas > 0 {
 			msg = "MySQL pod is starting up"
 		}
-		return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, msg)
+		return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, msg, resolvedImage)
 	}
 
 	// Check Pod status to get more detailed information
@@ -338,7 +392,7 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 
 		switch pod.Status.Phase {
 		case corev1.PodPending:
-			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Pod is pending, waiting for resources")
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Pod is pending, waiting for resources", resolvedImage)
 		case corev1.PodFailed:
 			msg := "Pod has failed"
 			for _, containerStatus := range pod.Status.ContainerStatuses {
@@ -351,7 +405,7 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 					break
 				}
 			}
-			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Failed", false, msg)
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Failed", false, msg, resolvedImage)
 		case corev1.PodRunning:
 			isReady := false
 			for _, condition := range pod.Status.Conditions {
@@ -361,22 +415,22 @@ func (r *MySQLReconciler) updateMySQLStatus(ctx context.Context, mysql *database
 				}
 			}
 			if isReady && readyReplicas > 0 {
-				return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running and ready")
+				return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running and ready", resolvedImage)
 			}
-			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Pod is running but not ready yet")
+			return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Pod is running but not ready yet", resolvedImage)
 		}
 	}
 
 	// Fallback: Use StatefulSet status
 	if readyReplicas > 0 && availableReplicas > 0 {
-		return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running")
+		return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Running", true, "MySQL instance is running", resolvedImage)
 	}
-	return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Waiting for MySQL to become ready")
+	return r.statusUpdateWithRetry(ctx, mysql.Namespace, mysql.Name, "Pending", false, "Waiting for MySQL to become ready", resolvedImage)
 }
 
 // statusUpdateWithRetry performs a status update with retry-on-conflict to handle
 // concurrent modifications (e.g. rapid re-reconciliation or external updates).
-func (r *MySQLReconciler) statusUpdateWithRetry(ctx context.Context, ns, name, phase string, ready bool, message string) error {
+func (r *MySQLReconciler) statusUpdateWithRetry(ctx context.Context, ns, name, phase string, ready bool, message, resolvedImage string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		mysql := &databasev1alpha1.MySQL{}
 		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, mysql); err != nil {
@@ -385,6 +439,9 @@ func (r *MySQLReconciler) statusUpdateWithRetry(ctx context.Context, ns, name, p
 		mysql.Status.Phase = phase
 		mysql.Status.Ready = ready
 		mysql.Status.Message = message
+		if resolvedImage != "" {
+			mysql.Status.ResolvedImage = resolvedImage
+		}
 		return r.Status().Update(ctx, mysql)
 	})
 }
@@ -407,6 +464,45 @@ func (r *MySQLReconciler) secretForMySQL(m *databasev1alpha1.MySQL, sanitizedNam
 	return secret
 }
 
+// reconcileStatefulSet updates the live StatefulSet when desired image, pull policy, or replicas differ.
+// Does not mutate volumeClaimTemplates (immutable after create).
+func (r *MySQLReconciler) reconcileStatefulSet(ctx context.Context, found, desired *appsv1.StatefulSet) error {
+	log := log.FromContext(ctx)
+	updated := false
+
+	if desired.Spec.Replicas != nil {
+		if found.Spec.Replicas == nil || *found.Spec.Replicas != *desired.Spec.Replicas {
+			found.Spec.Replicas = desired.Spec.Replicas
+			updated = true
+		}
+	}
+
+	if len(found.Spec.Template.Spec.Containers) == 0 || len(desired.Spec.Template.Spec.Containers) == 0 {
+		if updated {
+			log.Info("Updating StatefulSet replicas", "StatefulSet.Name", found.Name)
+			return r.Update(ctx, found)
+		}
+		return nil
+	}
+
+	fc := &found.Spec.Template.Spec.Containers[0]
+	dc := desired.Spec.Template.Spec.Containers[0]
+	if fc.Image != dc.Image {
+		fc.Image = dc.Image
+		updated = true
+	}
+	if fc.ImagePullPolicy != dc.ImagePullPolicy {
+		fc.ImagePullPolicy = dc.ImagePullPolicy
+		updated = true
+	}
+
+	if !updated {
+		return nil
+	}
+	log.Info("Updating StatefulSet", "StatefulSet.Name", found.Name, "image", fc.Image, "imagePullPolicy", fc.ImagePullPolicy)
+	return r.Update(ctx, found)
+}
+
 // headlessServiceForMySQL returns a headless Service required by the StatefulSet (stable network identity).
 func (r *MySQLReconciler) headlessServiceForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *corev1.Service {
 	return &corev1.Service{
@@ -425,7 +521,8 @@ func (r *MySQLReconciler) headlessServiceForMySQL(m *databasev1alpha1.MySQL, san
 }
 
 // statefulSetForMySQL returns a StatefulSet for MySQL with per-pod PVC via volumeClaimTemplates.
-func (r *MySQLReconciler) statefulSetForMySQL(m *databasev1alpha1.MySQL, sanitizedName string) *appsv1.StatefulSet {
+// imageTag is the concrete MySQL image tag (already resolved from channel pins when applicable).
+func (r *MySQLReconciler) statefulSetForMySQL(m *databasev1alpha1.MySQL, sanitizedName, imageTag string) *appsv1.StatefulSet {
 	replicas := int32(1)
 	if m.Spec.Replicas != nil && *m.Spec.Replicas >= 1 && *m.Spec.Replicas <= 2 {
 		replicas = *m.Spec.Replicas
@@ -448,8 +545,9 @@ func (r *MySQLReconciler) statefulSetForMySQL(m *databasev1alpha1.MySQL, sanitiz
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "mysql",
-							Image: fmt.Sprintf("mysql:%s", m.Spec.Version),
+							Name:            "mysql",
+							Image:           fmt.Sprintf("mysql:%s", imageTag),
+							ImagePullPolicy: corev1.PullAlways,
 							Ports: []corev1.ContainerPort{
 								{ContainerPort: 3306, Name: "mysql"},
 							},
@@ -517,5 +615,24 @@ func (r *MySQLReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.Secret{}).
+		Watches(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.mapChannelPinsConfigMap)).
 		Complete(r)
+}
+
+// mapChannelPinsConfigMap enqueues all MySQL CRs when the Offering channel-pins ConfigMap changes.
+func (r *MySQLReconciler) mapChannelPinsConfigMap(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetName() != r.pinsConfigMapName() || obj.GetNamespace() != r.pinsNamespace() {
+		return nil
+	}
+	list := &databasev1alpha1.MySQLList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(list.Items))
+	for i := range list.Items {
+		reqs = append(reqs, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: list.Items[i].Name, Namespace: list.Items[i].Namespace},
+		})
+	}
+	return reqs
 }

@@ -60,11 +60,11 @@ When a `MySQL` CR exists, the operator must ensure equivalent owned resources ex
 
 **Acceptance (R2):**
 
-- [ ] After apply: Secret, PVC, workload, and Service exist.
-- [ ] MySQL pod becomes Ready.
-- [ ] Clients can connect through the Service (e.g. port-forward to Service port 3306).
-- [ ] Changing `spec.version` updates the workload image without requiring CR delete.
-- [ ] Deleting the CR removes owned children (subject to PVC reclaim policy).
+- [x] After apply: Secret, PVC, workload, and Service exist.
+- [x] MySQL pod becomes Ready.
+- [x] Clients can connect through the Service (e.g. port-forward to Service port 3306).
+- [x] Changing `spec.version` updates the workload image without requiring CR delete.
+- [x] Deleting the CR removes owned children (subject to PVC reclaim policy).
 
 ---
 
@@ -117,15 +117,16 @@ When a `MySQL` CR exists, the operator must ensure equivalent owned resources ex
 
 | ID | Requirement | State |
 |----|-------------|-------|
-| R6.1 | At any time, we will require to look up the vendor for latest minor versions for the respective major versions, and keep handy.  | Required |
-| R6.2 | Any existing deployments will require to be upgraded to the available/downloaded latest versions from the vendor. In no way, the underlying data could be lost. Downtime is accepted.| Required |
+| R6.1 | At any time, we will manually look up the vendor for latest minor versions for the respective major versions, and keep handy.  | Required |
+| R6.1.1 | An arrangement to be in place so that  that instruction can be passed to the deployment/cluster when it we decide to and made as part of a merged PR, and must not be a K8s resource change, which is considered as the core code, but something that even an Offering manager, or release team can perform. | Required |
+| R6.2 | Any existing deployments will require to be upgraded to the available/downloaded latest versions from the vendor, when the instruction (in R6.1.1) is made. In no way, the underlying data could be lost. Downtime is accepted.| Required |
 | R6.3 | A concept of maintenance window will have to introduced so that in future upgrades, the customers can be informed. | Required |
 
-**Acceptance (R5):**
+**Acceptance (R6):**
 
-- [ ] Provisioning an instance will always be in the latest minor version. 
-- [ ] An existing instance be upgraded to the latest available minor version. 
-- [ ] After a maintenance window is introduced, An existing instance be upgraded only during the maintenance window. 
+- [x] Provisioning an instance uses the pinned minor from the channel pins file (when Spec is a channel).
+- [x] An existing channel instance is upgraded when the pin instruction (PR → ConfigMap) changes, during its maintenance window (data retained; downtime accepted).
+- [x] Pin-driven upgrades apply only during `spec.maintenanceWindow` (or stay deferred if unset). 
 
 ---
 
@@ -152,8 +153,8 @@ When a `MySQL` CR exists, the operator must ensure equivalent owned resources ex
 
 **Acceptance:**
 
-- [ ] Workload pod template sets `imagePullPolicy: Always` for the MySQL container.
-- [ ] With registry reachable, recreating the pod can resolve a newer digest for the same tag; `SELECT VERSION()` matches the pulled build (or unchanged if upstream tag unchanged).
+- [x] Workload pod template sets `imagePullPolicy: Always` for the MySQL container.
+- [ ] With registry reachable, recreating the pod can resolve a newer digest for the same tag; `SELECT VERSION()` matches the pulled build (or unchanged if upstream tag unchanged). *(verify on Kind after deploy)*
 
 ---
 
@@ -163,9 +164,9 @@ When a `MySQL` CR exists, the operator must ensure equivalent owned resources ex
 
 **Acceptance:**
 
-- [ ] Changing `spec.version` updates the workload image to `mysql:<newVersion>`.
-- [ ] Introducing Always pull on an operator upgrade updates existing workloads on reconcile.
-- [ ] Automated test covers “workload updated when desired image changes.”
+- [x] Changing `spec.version` updates the workload image to `mysql:<newVersion>`.
+- [x] Introducing Always pull on an operator upgrade updates existing workloads on reconcile.
+- [x] Automated test covers “workload updated when desired image changes.”
 
 **Out of scope for this proposal:**
 
@@ -187,8 +188,8 @@ When a `MySQL` CR exists, the operator must ensure equivalent owned resources ex
 
 **Acceptance:**
 
-- [ ] API docs / README / this requirements doc agree on channel vs pin.
-- [ ] Samples use an intentional channel or pin.
+- [x] API docs / README / this requirements doc agree on channel vs pin.
+- [x] Samples use an intentional channel or pin.
 - [ ] (Optional) CRD default for `version` if approved.
 
 ---

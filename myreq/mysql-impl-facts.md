@@ -61,7 +61,9 @@ On reconcile, the operator ensures these owned resources exist:
 - MySQL container: image `mysql:<spec.version>`, port 3306, data at `/var/lib/mysql` via PVC, `MYSQL_ROOT_PASSWORD` from Secret.
 - Single replica Deployment (not StatefulSet).
 
-**Known gap:** Existing children are **not** updated when Spec changes (create-only). Spec changes (e.g. version) do not automatically roll the Deployment today. See lessons L3 and proposed G1–G2 in `mysql-req.md`.
+**Update (2026-11-08):** StatefulSet image and `imagePullPolicy` are reconciled on Spec change (`reconcileStatefulSet`). MySQL container uses `imagePullPolicy: Always`. PVC/volumeClaimTemplates remain create-time only.
+
+**Update (R6):** Channel pins live in `config/mysql-channel-pins.yaml` → ConfigMap `my-mysql-operator-mysql-channel-pins`. Operator resolves channels via `ResolveImageTag`, watches the ConfigMap, gates pin-driven STS upgrades with `spec.maintenanceWindow`, sets `status.resolvedImage`. Stakeholder doc: `docs/mysql-version-and-upgrades.md`.
 
 **Primary code:** `internal/controller/mysql_controller.go` (`Reconcile`, `*ForMySQL` builders)
 

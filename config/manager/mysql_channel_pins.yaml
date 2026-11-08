@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-channel-pins
+  namespace: system
+  labels:
+    app.kubernetes.io/name: my-mysql-operator
+    app.kubernetes.io/managed-by: kustomize
+data:
+  # Synced from config/mysql-channel-pins.yaml — Offering/Release edit that file via PR.
+  channels.yaml: |
+    channels:
+      "8.4": "8.4.13"
+      "8.0": "8.0.46"

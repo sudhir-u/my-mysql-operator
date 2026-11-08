@@ -65,6 +65,14 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+        - name: MYSQL_CHANNEL_PINS_CONFIGMAP
+          # Matches namePrefix (my-mysql-operator-) + ConfigMap metadata.name
+          value: my-mysql-operator-mysql-channel-pins
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         ports: []
         securityContext:
           allowPrivilegeEscalation: false
