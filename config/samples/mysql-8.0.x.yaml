@@ -7,3 +7,6 @@ spec:
   version: "8.0"
   storageSize: "2Gi"
   rootPassword: "mysecretnewpassword"
+  maintenanceWindow:
+    start: "02:00"
+    end: "04:00"

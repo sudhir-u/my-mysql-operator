@@ -52,6 +52,27 @@ spec:
           spec:
             description: MySQLSpec defines the desired state of MySQL
             properties:
+              maintenanceWindow:
+                description: |-
+                  MaintenanceWindow is the daily UTC window when pin-driven (channel map) upgrades may roll the StatefulSet.
+                  If unset, pin-driven upgrades are deferred until a window is configured (safe default).
+                  Explicit Spec pin changes (customer-initiated) are applied immediately.
+                properties:
+                  end:
+                    description: |-
+                      End is the window end in UTC as HH:MM (24h). Example: "04:00"
+                      Windows that cross midnight are supported (e.g. start 23:00, end 01:00).
+                    pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                    type: string
+                  start:
+                    description: 'Start is the window start in UTC as HH:MM (24h).
+                      Example: "02:00"'
+                    pattern: ^([01]\d|2[0-3]):[0-5]\d$
+                    type: string
+                required:
+                - end
+                - start
+                type: object
               replicas:
                 description: Replicas is the number of MySQL pods (1 = single instance,
                   2 = primary/standby for failover).
@@ -67,7 +88,10 @@ spec:
                 description: StorageSize for the MySQL data volume (e.g., "10Gi")
                 type: string
               version:
-                description: Version of MySQL to deploy (e.g., "8.0", "5.7")
+                description: |-
+                  Version is the MySQL image tag: a channel (e.g. "8.4", "8.0") or a pin (e.g. "8.4.13").
+                  Channels are resolved via the Offering-owned channel pins ConfigMap to a concrete patch tag.
+                  Prefer not to use "latest". Image form: mysql:<resolved-tag>.
                 type: string
             required:
             - storageSize
@@ -94,6 +118,10 @@ spec:
                 description: Ready indicates whether the MySQL instance is ready to
                   accept connections
                 type: boolean
+              resolvedImage:
+                description: ResolvedImage is the concrete container image the operator
+                  is reconciling toward (e.g. mysql:8.4.13).
+                type: string
             type: object
         type: object
     served: true

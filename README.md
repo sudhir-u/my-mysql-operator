@@ -128,7 +128,7 @@ metadata:
   name: my-test-mysql
   namespace: default
 spec:
-  version: "8.0"              # MySQL version (e.g., "8.0", "8.4", "5.7")
+  version: "8.4"              # Channel (8.4) or pin (8.4.13); image mysql:<version>
   storageSize: "5Gi"            # Persistent storage size for MySQL data
   rootPassword: "mypassword"   # Optional: MySQL root password (defaults to "changeme")
 ```
@@ -184,7 +184,8 @@ kubectl apply -f https://raw.githubusercontent.com/<org>/my-mysql-operator/<tag 
 
 The MySQL CRD supports the following spec fields:
 
-- **version** (required): MySQL version to deploy (e.g., "8.0", "8.4", "5.7")
+- **version** (required): MySQL image tag — a **channel** (e.g. `"8.4"`, `"8.0"`) or a **pin** (e.g. `"8.4.13"`). Channels resolve via Offering-owned [`config/mysql-channel-pins.yaml`](config/mysql-channel-pins.yaml) to a concrete patch. Prefer not to use `"latest"`.
+- **maintenanceWindow** (optional): UTC `HH:MM` start/end when **pin-driven** upgrades may roll. See [docs/mysql-version-and-upgrades.md](docs/mysql-version-and-upgrades.md).
 - **storageSize** (required): Size of persistent storage for MySQL data (e.g., "10Gi", "20Gi")
 - **rootPassword** (optional): MySQL root user password. If not specified, defaults to "changeme"
 
