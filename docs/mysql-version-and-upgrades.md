@@ -1,7 +1,8 @@
 # MySQL versioning and upgrades
 
 **Audience:** Offering, Release, Support, Customer Success, and developers.  
-**Scope:** Current operator generation (R6 channel pins + maintenance windows).
+**Scope:** Current operator generation (R6 channel pins + maintenance windows).  
+**Architecture diagrams:** [architecture-and-flows.md](architecture-and-flows.md)
 
 ---
 

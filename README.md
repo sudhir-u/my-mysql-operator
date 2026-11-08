@@ -4,12 +4,17 @@
 
 The my-mysql-operator is a Kubernetes operator that simplifies the deployment and management of MySQL database instances on Kubernetes clusters. The operator uses Custom Resource Definitions (CRDs) to allow users to declaratively define MySQL instances, and automatically creates and manages the necessary Kubernetes resources including:
 
-- **Deployment**: MySQL container running the specified version
-- **Service**: ClusterIP service exposing MySQL on port 3306
-- **PersistentVolumeClaim**: Persistent storage for MySQL data
+- **StatefulSet**: MySQL container(s) for the specified / pin-resolved version
+- **Service**: ClusterIP (primary) and headless services
+- **PersistentVolumeClaim**: Per-pod data via volumeClaimTemplates
 - **Secret**: Stores the MySQL root password
 
 The operator watches for MySQL custom resources and ensures the desired state matches the actual state in the cluster.
+
+## Documentation
+
+- [Architecture and flows](docs/architecture-and-flows.md) — pictorial system context, reconcile/pin flows, modularization and automation roadmap
+- [Versioning and upgrades](docs/mysql-version-and-upgrades.md) — channel pins, maintenance windows, Offering/Support guidance
 
 ## Getting Started
 
